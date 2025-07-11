@@ -1,6 +1,6 @@
 # Autonomous Drone-Based System for High-Precision Structural Crack Detection
 
-![Project Banner](https://i.imgur.com/k2yVd5Z.png)
+
 *A state-of-the-art deep learning pipeline for identifying, measuring, and analyzing structural defects on high-rise infrastructure, now enhanced with Gemini AI.*
 
 ---
