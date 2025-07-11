@@ -121,7 +121,7 @@ The script will automatically detect your hardware, load the data, build the mod
 3. Launch the Interactive Web App
 The project includes a single-page web application (index.html) to showcase the results and interact with the Gemini API. Simply open this file in a web browser.
 
-🤖 AI-Powered Insights with Gemini
+##🤖 AI-Powered Insights with Gemini
 This project is enhanced with generative AI capabilities through the Gemini API:
 
 Automated Reporting: Generates high-level narrative summaries of the model's performance metrics, translating complex data into understandable insights.
