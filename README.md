@@ -121,21 +121,6 @@ The script will automatically detect your hardware, load the data, build the mod
 3. Launch the Interactive Web App
 The project includes a single-page web application (index.html) to showcase the results and interact with the Gemini API. Simply open this file in a web browser.
 
-##🤖 AI-Powered Insights with Gemini
-This project is enhanced with generative AI capabilities through the Gemini API:
-
-Automated Reporting: Generates high-level narrative summaries of the model's performance metrics, translating complex data into understandable insights.
-
-Code Explanation: Provides line-by-line explanations of complex code sections, such as the FocalTverskyLoss function, making the project's technical aspects more accessible.
-
-Interactive Image Analysis: Allows users to upload a new image of a crack and receive a real-time, qualitative analysis of its potential severity from the Gemini multimodal model.
-
-📊 Results
-After a full training run, the model achieves excellent performance on the unseen test set, with a Dice Score of over 0.85. The learning curves show a healthy training progression, indicating a well-generalized model.
-
-(Here you can insert your final learning curve plots and prediction images)
-
-Example of model predictions on unseen test images, with the predicted boundary overlaid in green.
 
 🚀 Future Work
 Hyperparameter Optimization: Systematically tune learning rates and loss function parameters to further boost performance.
