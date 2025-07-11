@@ -1,0 +1,690 @@
+# =============================================================================
+# CELL 1: ENHANCED IMPORTS AND SETUP
+# =============================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+import pandas as pd
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from tqdm.notebook import tqdm
+import os
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set plotting style
+sns.set_theme(style="whitegrid")
+plt.rcParams['figure.figsize'] = (14, 7)
+print("✅ All imports successful!")
+
+# =============================================================================
+# CELL 2: ENHANCED CONFIGURATION AND VALIDATION
+# =============================================================================
+
+# --- KAGGLE PATH CONFIGURATION ---
+KAGGLE_INPUT_DIR = Path("/kaggle/input/crackdataset/final_dataset_ready_for_training")
+METADATA_PATH = KAGGLE_INPUT_DIR / "metadata.csv"
+MODEL_SAVE_DIR = Path("/kaggle/working/models/")
+MODEL_SAVE_DIR.mkdir(exist_ok=True)
+
+# --- ENHANCED HYPERPARAMETERS ---
+MODEL_ARCHITECTURE = "unetplusplus"
+ENCODER_BACKBONE = "efficientnet-b1"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 8
+NUM_EPOCHS = 5  # Increased for better training
+IMAGE_SIZE = 512
+NUM_WORKERS = os.cpu_count()
+
+# Loss function parameters
+LOSS_ALPHA = 0.5
+LOSS_BETA = 0.5
+LOSS_GAMMA = 2.0
+
+# Training parameters
+PATIENCE = 7
+MIN_DELTA = 0.001
+LR_PATIENCE = 3
+LR_FACTOR = 0.5
+
+def validate_config():
+    """Validate training configuration before starting"""
+    print("🔍 Validating Configuration...")
+    
+    # Check device availability
+    if DEVICE == "cuda":
+        if torch.cuda.is_available():
+            print(f"✅ GPU found: {torch.cuda.get_device_name(0)}")
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"✅ GPU Memory: {total_memory:.1f} GB")
+        else:
+            print("❌ CUDA not available but requested")
+            return False
+    else:
+        print(⚠️  Running on CPU - training will be slow")
+    
+    # Check data paths
+    if not METADATA_PATH.exists():
+        print(f"❌ Metadata file not found: {METADATA_PATH}")
+        return False
+    else:
+        print(f"✅ Metadata file found: {METADATA_PATH}")
+    
+    # Check batch size vs available memory (rough estimate)
+    if DEVICE == "cuda":
+        estimated_usage = BATCH_SIZE * IMAGE_SIZE * IMAGE_SIZE * 3 * 4 / 1e9  # GB
+        if estimated_usage > total_memory * 0.8:
+            print(f"⚠️  Warning: Batch size might be too large (estimated {estimated_usage:.1f} GB)")
+    
+    print("✅ Configuration validation passed")
+    return True
+
+# Run validation
+config_valid = validate_config()
+print(f"\nConfiguration Summary:")
+print(f"  Device: {DEVICE}")
+print(f"  Model: {MODEL_ARCHITECTURE} with {ENCODER_BACKBONE}")
+print(f"  Image Size: {IMAGE_SIZE}x{IMAGE_SIZE}")
+print(f"  Batch Size: {BATCH_SIZE}")
+print(f"  Learning Rate: {LEARNING_RATE}")
+print(f"  Epochs: {NUM_EPOCHS}")
+
+# =============================================================================
+# CELL 3: ENHANCED HELPER CLASSES AND FUNCTIONS
+# =============================================================================
+
+# Enhanced Early Stopping Class
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0.001, verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+        
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.verbose:
+                print(f"✅ Validation loss improved to {val_loss:.6f}")
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"⚠️  No improvement for {self.counter}/{self.patience} epochs")
+            
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"🛑 Early stopping triggered!")
+        
+        return self.early_stop
+
+# Enhanced Data Transformations
+train_transforms = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=25, p=0.3),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+    A.OneOf([
+        A.ElasticTransform(alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03, p=0.5),
+        A.GridDistortion(p=0.5),
+        A.OpticalDistortion(distort_limit=2, shift_limit=0.5, p=0.5)
+    ], p=0.3),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+val_test_transforms = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+# Enhanced Dataset Class
+class CrackDataset(Dataset):
+    def __init__(self, dataframe, base_path, transforms=None):
+        self.df = dataframe
+        self.base_path = base_path
+        self.transforms = transforms
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        try:
+            row = self.df.iloc[idx]
+            
+            # Extract filenames from full paths
+            image_filename = row['image_path'].split('\\')[-1]
+            mask_filename = row['mask_path'].split('\\')[-1]
+            
+            # Construct correct paths
+            image_path = self.base_path / row['split'] / 'images' / image_filename
+            mask_path = self.base_path / row['split'] / 'masks' / mask_filename
+            
+            # Load image and mask
+            image = cv2.imread(str(image_path))
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            
+            if image is None or mask is None:
+                print(f"❌ Error loading: {image_path} or {mask_path}")
+                return torch.zeros((3, IMAGE_SIZE, IMAGE_SIZE)), torch.zeros((1, IMAGE_SIZE, IMAGE_SIZE))
+            
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Apply transformations
+            if self.transforms:
+                augmented = self.transforms(image=image, mask=mask)
+                image, mask = augmented['image'], augmented['mask']
+            
+            return image, mask.unsqueeze(0).float()
+            
+        except Exception as e:
+            print(f"❌ Error in dataset loading: {e}")
+            return torch.zeros((3, IMAGE_SIZE, IMAGE_SIZE)), torch.zeros((1, IMAGE_SIZE, IMAGE_SIZE))
+
+print("✅ Enhanced helper classes and functions defined!")
+
+# =============================================================================
+# CELL 4: ENHANCED LOSS FUNCTIONS AND METRICS
+# =============================================================================
+
+# Enhanced Focal Tversky Loss
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.5, beta=0.5, gamma=2.0, smooth=1e-6):
+        super(FocalTverskyLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+        
+    def forward(self, y_pred, y_true):
+        # Apply sigmoid to predictions
+        y_pred = torch.sigmoid(y_pred)
+        
+        # Flatten tensors
+        y_pred = y_pred.view(-1)
+        y_true = y_true.view(-1)
+        
+        # Calculate Tversky components
+        true_pos = (y_pred * y_true).sum()
+        false_neg = ((1 - y_pred) * y_true).sum()
+        false_pos = (y_pred * (1 - y_true)).sum()
+        
+        # Calculate Tversky index
+        tversky_index = (true_pos + self.smooth) / (
+            true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth
+        )
+        
+        # Apply focal component
+        focal_tversky = (1 - tversky_index) ** self.gamma
+        
+        return focal_tversky
+
+# Comprehensive Metrics
+def dice_score(y_pred, y_true, smooth=1e-6):
+    y_pred = torch.sigmoid(y_pred)
+    y_pred = (y_pred > 0.5).float().view(-1)
+    y_true = y_true.view(-1)
+    intersection = (y_pred * y_true).sum()
+    return (2. * intersection + smooth) / (y_pred.sum() + y_true.sum() + smooth)
+
+def iou_score(y_pred, y_true, smooth=1e-6):
+    y_pred = torch.sigmoid(y_pred)
+    y_pred = (y_pred > 0.5).float().view(-1)
+    y_true = y_true.view(-1)
+    intersection = (y_pred * y_true).sum()
+    union = y_pred.sum() + y_true.sum() - intersection
+    return (intersection + smooth) / (union + smooth)
+
+def precision_recall_f1(y_pred, y_true, smooth=1e-6):
+    y_pred = torch.sigmoid(y_pred)
+    y_pred = (y_pred > 0.5).float().view(-1)
+    y_true = y_true.view(-1)
+    
+    tp = (y_pred * y_true).sum()
+    fp = (y_pred * (1 - y_true)).sum()
+    fn = ((1 - y_pred) * y_true).sum()
+    
+    precision = (tp + smooth) / (tp + fp + smooth)
+    recall = (tp + smooth) / (tp + fn + smooth)
+    f1 = 2 * (precision * recall) / (precision + recall + smooth)
+    
+    return precision, recall, f1
+
+print("✅ Enhanced loss functions and metrics defined!")
+
+# =============================================================================
+# CELL 5: ENHANCED TRAINING AND VALIDATION FUNCTIONS
+# =============================================================================
+
+def train_one_epoch(loader, model, optimizer, loss_fn, scaler, device):
+    model.train()
+    running_loss = 0.0
+    
+    loop = tqdm(loader, desc="Training", leave=False)
+    for batch_idx, (data, targets) in enumerate(loop):
+        data, targets = data.to(device), targets.to(device)
+        
+        # Mixed precision training
+        with torch.cuda.amp.autocast():
+            predictions = model(data)
+            loss = loss_fn(predictions, targets)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        running_loss += loss.item()
+        
+        # Update progress bar
+        loop.set_postfix(loss=loss.item())
+    
+    return running_loss / len(loader)
+
+def validate_one_epoch(loader, model, loss_fn, device):
+    model.eval()
+    val_loss = 0.0
+    all_dice_scores = []
+    all_iou_scores = []
+    all_precision = []
+    all_recall = []
+    all_f1 = []
+    
+    loop = tqdm(loader, desc="Validating", leave=False)
+    
+    with torch.no_grad():
+        for data, targets in loop:
+            data, targets = data.to(device), targets.to(device)
+            predictions = model(data)
+            
+            # Calculate loss
+            loss = loss_fn(predictions, targets)
+            val_loss += loss.item()
+            
+            # Calculate metrics
+            dice = dice_score(predictions, targets)
+            iou = iou_score(predictions, targets)
+            precision, recall, f1 = precision_recall_f1(predictions, targets)
+            
+            all_dice_scores.append(dice.cpu().numpy())
+            all_iou_scores.append(iou.cpu().numpy())
+            all_precision.append(precision.cpu().numpy())
+            all_recall.append(recall.cpu().numpy())
+            all_f1.append(f1.cpu().numpy())
+    
+    # Calculate averages
+    metrics = {
+        'val_loss': val_loss / len(loader),
+        'dice': np.mean(all_dice_scores),
+        'iou': np.mean(all_iou_scores),
+        'precision': np.mean(all_precision),
+        'recall': np.mean(all_recall),
+        'f1': np.mean(all_f1)
+    }
+    
+    # Print results
+    print(f"📊 Validation Results:")
+    print(f"   Loss: {metrics['val_loss']:.4f}")
+    print(f"   Dice: {metrics['dice']:.4f}")
+    print(f"   IoU:  {metrics['iou']:.4f}")
+    print(f"   Precision: {metrics['precision']:.4f}")
+    print(f"   Recall: {metrics['recall']:.4f}")
+    print(f"   F1: {metrics['f1']:.4f}")
+    
+    return metrics
+
+print("✅ Enhanced training and validation functions defined!")
+
+# =============================================================================
+# CELL 6: ENHANCED VISUALIZATION FUNCTIONS
+# =============================================================================
+
+def plot_comprehensive_metrics(history):
+    """Plot comprehensive training metrics dashboard"""
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle('🚀 Comprehensive Training Metrics Dashboard', fontsize=16, fontweight='bold')
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # Loss curves
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-o', label='Training Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-o', label='Validation Loss', linewidth=2)
+    axes[0, 0].set_title('📈 Training vs Validation Loss', fontweight='bold')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Dice and IoU scores
+    axes[0, 1].plot(epochs, history['dice_score'], 'g-o', label='Dice Score', linewidth=2)
+    axes[0, 1].plot(epochs, history['iou_score'], 'orange', marker='o', label='IoU Score', linewidth=2)
+    axes[0, 1].set_title('🎯 Segmentation Metrics', fontweight='bold')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Score')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_ylim(0, 1)
+    
+    # Precision, Recall, F1
+    axes[0, 2].plot(epochs, history['precision'], 'purple', marker='o', label='Precision', linewidth=2)
+    axes[0, 2].plot(epochs, history['recall'], 'brown', marker='o', label='Recall', linewidth=2)
+    axes[0, 2].plot(epochs, history['f1_score'], 'pink', marker='o', label='F1 Score', linewidth=2)
+    axes[0, 2].set_title('📊 Classification Metrics', fontweight='bold')
+    axes[0, 2].set_xlabel('Epoch')
+    axes[0, 2].set_ylabel('Score')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 2].set_ylim(0, 1)
+    
+    # Final metrics bar chart
+    final_metrics = [history['dice_score'][-1], history['iou_score'][-1], 
+                    history['precision'][-1], history['recall'][-1], history['f1_score'][-1]]
+    metric_names = ['Dice', 'IoU', 'Precision', 'Recall', 'F1']
+    
+    bars = axes[1, 0].bar(metric_names, final_metrics, color=['green', 'orange', 'purple', 'brown', 'pink'])
+    axes[1, 0].set_title('📋 Final Metrics Summary', fontweight='bold')
+    axes[1, 0].set_ylabel('Score')
+    axes[1, 0].set_ylim(0, 1)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, final_metrics):
+        axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                       f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # Overfitting monitor
+    train_val_gap = np.array(history['train_loss']) - np.array(history['val_loss'])
+    axes[1, 1].plot(epochs, train_val_gap, 'red', marker='o', label='Train-Val Loss Gap', linewidth=2)
+    axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    axes[1, 1].set_title('⚠️ Overfitting Monitor', fontweight='bold')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Loss Difference')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # Learning curve
+    axes[1, 2].plot(epochs, history['val_loss'], 'r-o', label='Validation Loss', linewidth=2)
+    axes[1, 2].set_title('📈 Learning Curve', fontweight='bold')
+    axes[1, 2].set_xlabel('Epoch')
+    axes[1, 2].set_ylabel('Validation Loss')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+def visualize_predictions(model, test_loader, device, num_samples=4):
+    """Enhanced prediction visualization"""
+    model.eval()
+    
+    with torch.no_grad():
+        images, masks = next(iter(test_loader))
+        images = images.to(device)
+        predictions = model(images)
+        binary_preds = (torch.sigmoid(predictions) > 0.5).float()
+    
+    # Move to CPU for visualization
+    images, masks, binary_preds = images.cpu(), masks.cpu(), binary_preds.cpu()
+    
+    num_samples = min(num_samples, len(images))
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, num_samples * 4))
+    fig.suptitle("🔍 Model Predictions on Test Data", fontsize=16, fontweight='bold')
+    
+    for i in range(num_samples):
+        # Denormalize image
+        img_display = images[i].permute(1, 2, 0).numpy()
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_display = std * img_display + mean
+        img_display = np.clip(img_display, 0, 1)
+        
+        # Original Image
+        axes[i, 0].imshow(img_display)
+        axes[i, 0].set_title("🖼️ Original Image", fontweight='bold')
+        axes[i, 0].axis('off')
+        
+        # Ground Truth
+        axes[i, 1].imshow(masks[i].squeeze(), cmap='gray')
+        axes[i, 1].set_title("🎯 Ground Truth", fontweight='bold')
+        axes[i, 1].axis('off')
+        
+        # Prediction
+        axes[i, 2].imshow(binary_preds[i].squeeze(), cmap='gray')
+        axes[i, 2].set_title("🤖 Prediction", fontweight='bold')
+        axes[i, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+print("✅ Enhanced visualization functions defined!")
+
+# =============================================================================
+# CELL 7: MAIN EXECUTION - DATA PREPARATION
+# =============================================================================
+
+print("🚀 Starting Enhanced Training Pipeline")
+print("=" * 60)
+
+# Load and analyze data
+df = pd.read_csv(METADATA_PATH)
+print(f"📊 Dataset Overview:")
+print(f"   Total samples: {len(df)}")
+print(f"   Training samples: {len(df[df['split'] == 'train'])}")
+print(f"   Validation samples: {len(df[df['split'] == 'validation'])}")
+print(f"   Test samples: {len(df[df['split'] == 'test'])}")
+
+# Create datasets
+train_df = df[df['split'] == 'train'].reset_index(drop=True)
+val_df = df[df['split'] == 'validation'].reset_index(drop=True)
+test_df = df[df['split'] == 'test'].reset_index(drop=True)
+
+train_dataset = CrackDataset(train_df, base_path=KAGGLE_INPUT_DIR, transforms=train_transforms)
+val_dataset = CrackDataset(val_df, base_path=KAGGLE_INPUT_DIR, transforms=val_test_transforms)
+test_dataset = CrackDataset(test_df, base_path=KAGGLE_INPUT_DIR, transforms=val_test_transforms)
+
+# Create data loaders
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=BATCH_SIZE, 
+    num_workers=NUM_WORKERS, 
+    pin_memory=True, 
+    shuffle=True
+)
+
+val_loader = DataLoader(
+    val_dataset, 
+    batch_size=BATCH_SIZE, 
+    num_workers=NUM_WORKERS, 
+    pin_memory=True, 
+    shuffle=False
+)
+
+test_loader = DataLoader(
+    test_dataset, 
+    batch_size=BATCH_SIZE, 
+    num_workers=NUM_WORKERS, 
+    pin_memory=True, 
+    shuffle=True
+)
+
+print(f"✅ Data loaders created successfully!")
+print(f"   Training batches: {len(train_loader)}")
+print(f"   Validation batches: {len(val_loader)}")
+print(f"   Test batches: {len(test_loader)}")
+
+# =============================================================================
+# CELL 8: MODEL INITIALIZATION AND SETUP
+# =============================================================================
+
+print("\n🏗️ Initializing Model and Training Components")
+print("=" * 60)
+
+# Import segmentation models
+try:
+    import segmentation_models_pytorch as smp
+    print("✅ Segmentation Models PyTorch imported successfully")
+except ImportError:
+    print("❌ Please install: pip install segmentation-models-pytorch")
+    raise
+
+# Initialize model
+model = smp.UnetPlusPlus(
+    encoder_name=ENCODER_BACKBONE,
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1,
+    activation=None  # We'll apply sigmoid in loss function
+).to(DEVICE)
+
+print(f"✅ Model initialized: {MODEL_ARCHITECTURE} with {ENCODER_BACKBONE}")
+print(f"   Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f"   Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+# Initialize loss function and optimizer
+loss_fn = FocalTverskyLoss(alpha=LOSS_ALPHA, beta=LOSS_BETA, gamma=LOSS_GAMMA)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+
+# Initialize learning rate scheduler
+scheduler = ReduceLROnPlateau(
+    optimizer, 
+    mode='min', 
+    factor=LR_FACTOR, 
+    patience=LR_PATIENCE, 
+    verbose=True,
+    min_lr=1e-7
+)
+
+# Initialize early stopping
+early_stopping = EarlyStopping(patience=PATIENCE, min_delta=MIN_DELTA, verbose=True)
+
+# Initialize mixed precision scaler
+scaler = torch.cuda.amp.GradScaler()
+
+print("✅ Training components initialized:")
+print(f"   Loss Function: Focal Tversky Loss (α={LOSS_ALPHA}, β={LOSS_BETA}, γ={LOSS_GAMMA})")
+print(f"   Optimizer: AdamW (lr={LEARNING_RATE})")
+print(f"   Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
+print(f"   Early Stopping: Patience={PATIENCE}, Min Delta={MIN_DELTA}")
+
+# =============================================================================
+# CELL 9: ENHANCED TRAINING LOOP
+# =============================================================================
+
+print("\n🚀 Starting Enhanced Training Loop")
+print("=" * 60)
+
+# Initialize tracking variables
+best_val_loss = float('inf')
+best_dice = 0.0
+best_model_path = None
+
+# Initialize history tracking
+history = {
+    'train_loss': [],
+    'val_loss': [],
+    'dice_score': [],
+    'iou_score': [],
+    'precision': [],
+    'recall': [],
+    'f1_score': [],
+    'learning_rate': []
+}
+
+# Training loop
+start_time = time.time()
+
+for epoch in range(NUM_EPOCHS):
+    print(f"\n🔄 Epoch {epoch+1}/{NUM_EPOCHS}")
+    print("-" * 50)
+    
+    # Get current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"📊 Current Learning Rate: {current_lr:.2e}")
+    
+    # Training phase
+    print("🏃 Training Phase...")
+    train_loss = train_one_epoch(train_loader, model, optimizer, loss_fn, scaler, DEVICE)
+    
+    # Validation phase
+    print("🔍 Validation Phase...")
+    val_metrics = validate_one_epoch(val_loader, model, loss_fn, DEVICE)
+    
+    # Update learning rate scheduler
+    scheduler.step(val_metrics['val_loss'])
+    
+    # Store metrics in history
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_metrics['val_loss'])
+    history['dice_score'].append(val_metrics['dice'])
+    history['iou_score'].append(val_metrics['iou'])
+    history['precision'].append(val_metrics['precision'])
+    history['recall'].append(val_metrics['recall'])
+    history['f1_score'].append(val_metrics['f1'])
+    history['learning_rate'].append(current_lr)
+    
+    # Check for best model (using combination of loss and dice)
+    is_best = (val_metrics['val_loss'] < best_val_loss) or \
+              (val_metrics['val_loss'] <= best_val_loss * 1.01 and val_metrics['dice'] > best_dice)
+    
+    if is_best:
+        best_val_loss = val_metrics['val_loss']
+        best_dice = val_metrics['dice']
+        
+        # Save best model
+        best_model_path = MODEL_SAVE_DIR / f"{MODEL_ARCHITECTURE}_{ENCODER_BACKBONE}_best_epoch{epoch+1}.pth"
+        
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'val_loss': val_metrics['val_loss'],
+            'dice_score': val_metrics['dice'],
+            'hyperparameters': {
+                'learning_rate': LEARNING_RATE,
+                'batch_size': BATCH_SIZE,
+                'image_size': IMAGE_SIZE,
+                'loss_alpha': LOSS_ALPHA,
+                'loss_beta': LOSS_BETA,
+                'loss_gamma': LOSS_GAMMA,
+                'encoder_backbone': ENCODER_BACKBONE
+            },
+            'history': history
+        }
+        
+        torch.save(checkpoint, best_model_path)
+        print(f"💾 New best model saved: {best_model_path.name}")
+        print(f"   Best Validation Loss: {best_val_loss:.6f}")
+        print(f"   Best Dice Score: {best_dice:.6f}")
+    
+    # Print epoch summary
+    print(f"\n📈 Epoch {epoch+1} Summary:")
+    print(f"   Train Loss: {train_loss:.6f}")
+    print(f"   Val Loss: {val_metrics['val_loss']:.6f}")
+    print(f"   Dice Score: {val_metrics['dice']:.6f}")
+    print(f"   IoU Score: {val_metrics['iou']:.6f}")
+    
+    # Early stopping check
+    if early_stopping(val_metrics['val_loss']):
+        print(f"\n🛑 Early stopping triggered at epoch {epoch+1}")
+        break
+
+# Training completion
+end_time = time.time()
+training_time =
